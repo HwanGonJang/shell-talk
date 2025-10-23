@@ -29,6 +29,11 @@ type Hub struct {
 
 	// DM 처리를 위한 채널
 	directMessage chan *DirectMessage
+
+	// Room 처리를 위한 필드
+	rooms    map[string]*Room
+	roomsMu  sync.RWMutex
+	listRooms chan *Client
 }
 
 // NewHub 새 Hub를 생성합니다.
@@ -38,6 +43,8 @@ func NewHub() *Hub {
 		register:      make(chan *Client),
 		unregister:    make(chan *Client),
 		directMessage: make(chan *DirectMessage),
+		rooms:         make(map[string]*Room),
+		listRooms:     make(chan *Client),
 	}
 }
 
@@ -63,6 +70,9 @@ func (h *Hub) Run() {
 		case dm := <-h.directMessage:
 			// 1:1 메시지 처리
 			h.handleDirectMessage(dm)
+
+		case client := <-h.listRooms:
+			h.handleListRooms(client)
 		}
 	}
 }
@@ -104,12 +114,22 @@ func (h *Hub) registerClient(client *Client) bool {
 // unregisterClient Hub에서 클라이언트를 등록 해제합니다.
 func (h *Hub) unregisterClient(client *Client) {
 	h.clientsMu.Lock()
-	defer h.clientsMu.Unlock()
-
+	// Remove the client from the central map
 	if _, ok := h.clients[client.Nickname]; ok {
 		delete(h.clients, client.Nickname)
 		close(client.Send)
 		log.Printf("Client unregistered: %s", client.Nickname)
+	} else {
+		h.clientsMu.Unlock()
+		return
+	}
+	h.clientsMu.Unlock()
+
+	// Remove the client from all rooms they might have joined
+	h.roomsMu.RLock()
+	defer h.roomsMu.RUnlock()
+	for _, room := range h.rooms {
+		room.removeClient(client)
 	}
 }
 
@@ -157,4 +177,147 @@ func (h *Hub) handleDirectMessage(dm *DirectMessage) {
 		// 수신자의 채널이 꽉 찼거나 닫힌 경우
 		log.Printf("DM Failed: Recipient '%s' channel is full or closed.", dm.RecipientNickname)
 	}
+}
+
+// handleListRooms sends the list of rooms to a client.
+func (h *Hub) handleListRooms(client *Client) {
+	h.roomsMu.RLock()
+	defer h.roomsMu.RUnlock()
+
+	roomInfos := make([]domain.RoomInfo, 0, len(h.rooms))
+	for _, room := range h.rooms {
+		roomInfos = append(roomInfos, domain.RoomInfo{ID: room.ID, Name: room.Name})
+	}
+
+	payload := domain.RoomListPayload{Rooms: roomInfos}
+	resp := domain.WebSocketMessage{Type: "room_list", Payload: payload}
+
+	jsonMsg, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Failed to marshal room list: %v", err)
+		return
+	}
+
+	client.Send <- jsonMsg
+}
+
+// createRoom creates a new room.
+func (h *Hub) createRoom(name, password string, client *Client) {
+	h.roomsMu.Lock()
+	defer h.roomsMu.Unlock()
+
+	// Check if room name already exists.
+	for _, room := range h.rooms {
+		if room.Name == name {
+			client.sendSystemMessage("error_message", fmt.Sprintf("Room name '%s' is already taken.", name))
+			return
+		}
+	}
+
+	room := NewRoom(name, password, h)
+	h.rooms[room.ID] = room
+
+	// Automatically join the creator to the room.
+	room.addClient(client)
+
+	log.Printf("Room created: %s (ID: %s) by %s", name, room.ID, client.Nickname)
+	client.sendSystemMessage("system_message", fmt.Sprintf("Room '%s' created successfully.", name))
+
+	// Send join success message
+	joinPayload := domain.JoinSuccessPayload{RoomID: room.ID, RoomName: room.Name}
+	resp := domain.WebSocketMessage{Type: "join_success", Payload: joinPayload}
+	if jsonMsg, err := json.Marshal(resp); err == nil {
+		client.Send <- jsonMsg
+	} else {
+		log.Printf("Failed to marshal join_success message: %v", err)
+	}
+}
+
+// joinRoom adds a client to a room.
+func (h *Hub) joinRoom(roomID, password string, client *Client) {
+	h.roomsMu.RLock()
+	room, ok := h.rooms[roomID]
+	h.roomsMu.RUnlock()
+
+	if !ok {
+		client.sendSystemMessage("error_message", "Room not found.")
+		return
+	}
+
+	if room.Password != password {
+		client.sendSystemMessage("error_message", "Invalid password.")
+		return
+	}
+
+	room.addClient(client)
+
+	log.Printf("Client %s joined room %s", client.Nickname, room.Name)
+
+	// Send join success message
+	payload := domain.JoinSuccessPayload{RoomID: room.ID, RoomName: room.Name}
+	resp := domain.WebSocketMessage{Type: "join_success", Payload: payload}
+	if jsonMsg, err := json.Marshal(resp); err == nil {
+		client.Send <- jsonMsg
+	} else {
+		log.Printf("Failed to marshal join_success message: %v", err)
+	}
+}
+
+// leaveRoom removes a client from a room.
+func (h *Hub) leaveRoom(roomID string, client *Client) {
+	h.roomsMu.RLock()
+	room, ok := h.rooms[roomID]
+	h.roomsMu.RUnlock()
+
+	if !ok {
+		client.sendSystemMessage("error_message", "Room not found.")
+		return
+	}
+
+	room.removeClient(client)
+
+	log.Printf("Client %s left room %s", client.Nickname, room.Name)
+
+	// Send leave success message
+	payload := domain.LeaveSuccessPayload{RoomID: room.ID}
+	resp := domain.WebSocketMessage{Type: "leave_success", Payload: payload}
+	if jsonMsg, err := json.Marshal(resp); err == nil {
+		client.Send <- jsonMsg
+	} else {
+		log.Printf("Failed to marshal leave_success message: %v", err)
+	}
+}
+
+// handleRoomMessage broadcasts a message to a room.
+func (h *Hub) handleRoomMessage(roomID, content string, client *Client) {
+	h.roomsMu.RLock()
+	room, ok := h.rooms[roomID]
+	h.roomsMu.RUnlock()
+
+	if !ok {
+		client.sendSystemMessage("error_message", "Room not found.")
+		return
+	}
+
+	// Check if the client is in the room.
+	if !room.hasClient(client) {
+		client.sendSystemMessage("error_message", "You are not in this room.")
+		return
+	}
+
+	payload := domain.RoomMessagePayload{
+		RoomID:    roomID,
+		Sender:    client.Nickname,
+		Content:   content,
+		Timestamp: time.Now(),
+	}
+
+	resp := domain.WebSocketMessage{Type: "room_message", Payload: payload}
+	jsonMsg, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Failed to marshal room message: %v", err)
+		return
+	}
+
+	room.broadcast(jsonMsg, client)
 }
