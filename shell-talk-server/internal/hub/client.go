@@ -35,22 +35,54 @@ func (c *Client) readPump() {
 		}
 
 		// 메시지 타입에 따라 처리
-		if req.Type == "send_direct_message" {
-			// 페이로드 파싱
+		switch req.Type {
+		case "send_direct_message":
 			var payload domain.SendDirectMessagePayload
 			payloadBytes, _ := json.Marshal(req.Payload)
 			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 				log.Printf("Invalid DM payload from %s: %v", c.Nickname, err)
 				continue
 			}
-
-			// Hub의 DM 채널로 메시지 전송 요청
 			dmRequest := &DirectMessage{
 				SenderNickname:    c.Nickname,
 				RecipientNickname: payload.Recipient,
 				Content:           payload.Content,
 			}
 			c.Hub.directMessage <- dmRequest
+		case "create_room":
+			var payload domain.CreateRoomPayload
+			payloadBytes, _ := json.Marshal(req.Payload)
+			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+				log.Printf("Invalid create_room payload from %s: %v", c.Nickname, err)
+				continue
+			}
+			c.Hub.createRoom(payload.Name, payload.Password, c)
+		case "join_room":
+			var payload domain.JoinRoomPayload
+			payloadBytes, _ := json.Marshal(req.Payload)
+			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+				log.Printf("Invalid join_room payload from %s: %v", c.Nickname, err)
+				continue
+			}
+			c.Hub.joinRoom(payload.RoomID, payload.Password, c)
+		case "leave_room":
+			var payload domain.LeaveRoomPayload
+			payloadBytes, _ := json.Marshal(req.Payload)
+			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+				log.Printf("Invalid leave_room payload from %s: %v", c.Nickname, err)
+				continue
+			}
+			c.Hub.leaveRoom(payload.RoomID, c)
+		case "send_room_message":
+			var payload domain.SendRoomMessagePayload
+			payloadBytes, _ := json.Marshal(req.Payload)
+			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+				log.Printf("Invalid send_room_message payload from %s: %v", c.Nickname, err)
+				continue
+			}
+			c.Hub.handleRoomMessage(payload.RoomID, payload.Content, c)
+		case "list_rooms":
+			c.Hub.listRooms <- c
 		}
 	}
 }
