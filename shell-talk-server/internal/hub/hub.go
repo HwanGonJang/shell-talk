@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"shell-talk-server/internal/domain"
 	"shell-talk-server/internal/service"
 	"sort"
@@ -143,9 +144,31 @@ func (h *Hub) authenticateClient(client *Client, user *domain.User) {
 	}
 	client.AuthInfo = &Auth{UserID: user.ID, Nickname: user.Nickname}
 	h.authenticatedClients[user.ID] = client
+
+	// Send login success message
 	loginSuccessPayload := domain.LoginSuccessPayload{UserID: user.ID, Nickname: user.Nickname}
 	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "login_success", Payload: loginSuccessPayload})
 	client.Send <- msg
+
+	// Send user their existing room memberships synchronously
+	h.syncUserRooms(client)
+}
+
+func (h *Hub) syncUserRooms(client *Client) {
+	if client.AuthInfo == nil {
+		return
+	}
+	rooms, err := h.roomService.GetUserRooms(client.AuthInfo.UserID)
+	if err != nil {
+		log.Printf("error syncing user rooms: %v", err)
+		return
+	}
+
+	for _, room := range rooms {
+		joinSuccessPayload := domain.JoinSuccessPayload{RoomID: room.ID.String(), RoomName: room.Name}
+		msg, _ := json.Marshal(domain.WebSocketMessage{Type: "join_success", Payload: joinSuccessPayload})
+		client.Send <- msg
+	}
 }
 
 // --- Message Handlers ---
@@ -287,6 +310,10 @@ func (h *Hub) handleSendRoomMessage(req *ClientRequest) {
 	}
 
 	for _, memberID := range memberIDs {
+		// Don't send the message back to the original sender
+		if memberID == req.Client.AuthInfo.UserID {
+			continue
+		}
 		if onlineClient, ok := h.authenticatedClients[memberID]; ok {
 			onlineClient.Send <- msg
 		}

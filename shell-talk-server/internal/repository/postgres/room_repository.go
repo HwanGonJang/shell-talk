@@ -44,6 +44,31 @@ func (r *RoomRepository) ListRooms() ([]*domain.Room, error) {
 	return rooms, nil
 }
 
+// GetUserRooms retrieves all rooms a user is a member of.
+func (r *RoomRepository) GetUserRooms(userID uuid.UUID) ([]*domain.Room, error) {
+	query := `
+		SELECT r.id, r.name, r.owner_id, r.password_hash, r.created_at 
+		FROM rooms r
+		JOIN room_members rm ON r.id = rm.room_id
+		WHERE rm.user_id = $1
+	`
+	rows, err := r.DB.Query(query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rooms []*domain.Room
+	for rows.Next() {
+		room := &domain.Room{}
+		if err := rows.Scan(&room.ID, &room.Name, &room.OwnerID, &room.PasswordHash, &room.CreatedAt); err != nil {
+			return nil, err
+		}
+		rooms = append(rooms, room)
+	}
+	return rooms, nil
+}
+
 // GetRoomByName retrieves a room by its unique name.
 func (r *RoomRepository) GetRoomByName(name string) (*domain.Room, error) {
 	room := &domain.Room{}

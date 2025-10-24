@@ -26,6 +26,7 @@ type IRoomService interface {
 	GetRoomMembers(name string) ([]string, error)
 	IsRoomMember(name string, user *domain.User) (bool, error)
 	GetRoomMemberIDs(name string) ([]uuid.UUID, error)
+	GetUserRooms(userID uuid.UUID) ([]*domain.Room, error)
 }
 
 // --- Repository Interfaces ---
@@ -47,6 +48,7 @@ type IRoomRepository interface {
 	RemoveUserFromRoom(roomID, userID uuid.UUID) error
 	IsRoomMember(roomID, userID uuid.UUID) (bool, error)
 	GetRoomMemberIDs(roomID uuid.UUID) ([]uuid.UUID, error)
+	GetUserRooms(userID uuid.UUID) ([]*domain.Room, error)
 }
 
 // IMessageRepository defines the interface for message persistence.

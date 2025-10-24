@@ -47,6 +47,11 @@ func (s *RoomService) CreateRoom(name, password string, owner *domain.User) (*do
 	return newRoom, nil
 }
 
+// GetUserRooms retrieves all rooms for a given user.
+func (s *RoomService) GetUserRooms(userID uuid.UUID) ([]*domain.Room, error) {
+	return s.roomRepo.GetUserRooms(userID)
+}
+
 // GetRoomByName retrieves a room by its unique name.
 func (s *RoomService) GetRoomByName(name string) (*domain.Room, error) {
 	return s.roomRepo.GetRoomByName(name)
