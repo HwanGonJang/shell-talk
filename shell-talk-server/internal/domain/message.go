@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // WebSocketMessage WebSocketMessage는 클라이언트와 서버 간의 표준 통신 포맷입니다.
 type WebSocketMessage struct {
@@ -8,10 +12,32 @@ type WebSocketMessage struct {
 	Payload interface{} `json:"payload"`
 }
 
+// --- Authentication Payloads ---
+
+// RegisterPayload is the payload for the 'register' message.
+type RegisterPayload struct {
+	Nickname string `json:"nickname"`
+	Password string `json:"password"`
+}
+
+// LoginPayload is the payload for the 'login' message.
+type LoginPayload struct {
+	Nickname string `json:"nickname"`
+	Password string `json:"password"`
+}
+
+// LoginSuccessPayload is the payload for the 'login_success' message.
+type LoginSuccessPayload struct {
+	UserID   uuid.UUID `json:"user_id"`
+	Nickname string    `json:"nickname"`
+}
+
+// --- DM & Room Message Payloads ---
+
 // SendDirectMessagePayload SendDirectMessagePayload는 'send_direct_message' 요청의 페이로드입니다.
 type SendDirectMessagePayload struct {
-	Recipient string `json:"recipient"` // 메시지 받을 사람의 닉네임
-	Content   string `json:"content"`
+	RecipientNickname string `json:"recipient_nickname"`
+	Content           string `json:"content"`
 }
 
 // DirectMessagePayload DirectMessagePayload는 'new_direct_message' 타입의 페이로드입니다.
@@ -21,11 +47,21 @@ type DirectMessagePayload struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// SystemPayload SystemPayload는 'system_message' 또는 'error_message' 타입의 페이로드입니다.
-type SystemPayload struct {
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
+// SendRoomMessagePayload is the payload for the 'send_room_message' message.
+type SendRoomMessagePayload struct {
+	RoomName string `json:"room_name"`
+	Content  string `json:"content"`
 }
+
+// RoomMessagePayload is the payload for the 'room_message' message.
+type RoomMessagePayload struct {
+	RoomName       string    `json:"room_name"`
+	SenderNickname string    `json:"sender_nickname"`
+	Content        string    `json:"content"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+// --- Room Management Payloads ---
 
 // CreateRoomPayload is the payload for the 'create_room' message.
 type CreateRoomPayload struct {
@@ -35,32 +71,29 @@ type CreateRoomPayload struct {
 
 // JoinRoomPayload is the payload for the 'join_room' message.
 type JoinRoomPayload struct {
-	RoomID   string `json:"room_id"`
+	RoomName string `json:"room_name"`
 	Password string `json:"password"`
 }
 
 // LeaveRoomPayload is the payload for the 'leave_room' message.
 type LeaveRoomPayload struct {
-	RoomID string `json:"room_id"`
+	RoomName string `json:"room_name"`
 }
 
-// SendRoomMessagePayload is the payload for the 'send_room_message' message.
-type SendRoomMessagePayload struct {
-	RoomID  string `json:"room_id"`
-	Content string `json:"content"`
+// ListMembersPayload is the payload for the 'list_members' message.
+type ListMembersPayload struct {
+	RoomName string `json:"room_name"`
 }
 
-// RoomMessagePayload is the payload for the 'room_message' message.
-type RoomMessagePayload struct {
-	RoomID    string    `json:"room_id"`
-	Sender    string    `json:"sender"`
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
+// RoomMembersPayload is the payload for the 'room_members' message.
+type RoomMembersPayload struct {
+	RoomName string   `json:"room_name"`
+	Members  []string `json:"members"` // List of nicknames
 }
 
 // RoomInfo represents basic information about a room.
 type RoomInfo struct {
-	ID   string `json:"id"`
+	ID   string `json:"id"` // This is the UUID
 	Name string `json:"name"`
 }
 
@@ -78,4 +111,12 @@ type JoinSuccessPayload struct {
 // LeaveSuccessPayload is the payload for the 'leave_success' message.
 type LeaveSuccessPayload struct {
 	RoomID string `json:"room_id"`
+}
+
+// --- System & Error Payloads ---
+
+// SystemPayload SystemPayload는 'system_message' 또는 'error_message' 타입의 페이로드입니다.
+type SystemPayload struct {
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
 }
