@@ -3,31 +3,48 @@ package main
 import (
 	"log"
 	"net/http"
-	"shell-talk-server/internal/handler"
-	"shell-talk-server/internal/hub"
+	"shell-talk-server/internal/config"
+	"shell-talk-server/internal/repository/postgres"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 )
 
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
 func main() {
-	// 1. 의존성 생성 (DI)
-	hub := hub.NewHub()
-	// Hub의 메인 루프를 고루틴으로 실행
-	go hub.Run()
+	cfg := config.Load()
 
-	wsHandler := handler.NewWebsocketHandler(hub)
+	// Run database migrations before starting the main app
+	if err := postgres.RunMigrations(cfg.PostgresURL); err != nil {
+		log.Fatalf("failed to run database migrations: %v", err)
+	}
+	log.Println("Database migrations completed successfully.")
 
-	// 2. 라우터 설정
+	app, cleanup, err := InitializeApp()
+	if err != nil {
+		log.Fatalf("failed to initialize app: %v", err)
+	}
+	defer cleanup()
+
+	go app.Hub.Run()
+
 	r := mux.NewRouter()
+	r.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("failed to upgrade connection: %v", err)
+			return
+		}
+		app.Hub.ServeWs(conn)
+	})
 
-	// WebSocket 라우트 (POST, GET API 제거)
-	// /ws?nickname=myname 형식으로 접속
-	r.HandleFunc("/ws", wsHandler.HandleConnection).Methods("GET")
-
-	// 3. 서버 시작
-	port := ":8080"
-	log.Printf("Server starting on port %s (DM Only Mode)", port)
-	if err := http.ListenAndServe(port, r); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	log.Println("Server started on :8080")
+	if err := http.ListenAndServe(":8080", r); err != nil {
+		log.Fatalf("failed to start server: %v", err)
 	}
 }

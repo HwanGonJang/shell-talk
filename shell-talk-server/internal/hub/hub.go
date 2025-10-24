@@ -1,323 +1,337 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"shell-talk-server/internal/domain"
-	"sync"
+	"shell-talk-server/internal/service"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
-// DirectMessage 1:1 메시지 전송 요청을 나타냅니다.
-type DirectMessage struct {
-	SenderNickname    string
-	RecipientNickname string
-	Content           string
+// ClientRequest bundles a client with their incoming message.
+type ClientRequest struct {
+	Client  *Client
+	Message domain.WebSocketMessage
 }
 
-// Hub 모든 활성화된 클라이언트를 관리하고 메시지를 중계합니다.
+// Hub maintains the set of active clients and broadcasts messages.
 type Hub struct {
-	// 닉네임을 키로 사용하여 클라이언트를 저장합니다.
-	clients    map[string]*Client
-	clientsMu  sync.RWMutex // clients 맵을 위한 Mutex
-	register   chan *Client
-	unregister chan *Client
-
-	// DM 처리를 위한 채널
-	directMessage chan *DirectMessage
-
-	// Room 처리를 위한 필드
-	rooms    map[string]*Room
-	roomsMu  sync.RWMutex
-	listRooms chan *Client
+	connections          map[*Client]bool
+	authenticatedClients map[uuid.UUID]*Client
+	messages             chan *ClientRequest
+	register             chan *Client
+	unregister           chan *Client
+	userService          service.IUserService
+	roomService          service.IRoomService
+	messageRepo          service.IMessageRepository
 }
 
-// NewHub 새 Hub를 생성합니다.
-func NewHub() *Hub {
+func NewHub(userService service.IUserService, roomService service.IRoomService, messageRepo service.IMessageRepository) *Hub {
 	return &Hub{
-		clients:       make(map[string]*Client),
-		register:      make(chan *Client),
-		unregister:    make(chan *Client),
-		directMessage: make(chan *DirectMessage),
-		rooms:         make(map[string]*Room),
-		listRooms:     make(chan *Client),
+		connections:          make(map[*Client]bool),
+		authenticatedClients: make(map[uuid.UUID]*Client),
+		messages:             make(chan *ClientRequest),
+		register:             make(chan *Client),
+		unregister:           make(chan *Client),
+		userService:          userService,
+		roomService:          roomService,
+		messageRepo:          messageRepo,
 	}
 }
 
-// Run Hub의 메인 이벤트 루프를 실행합니다.
 func (h *Hub) Run() {
-	log.Println("Hub is now running...")
 	for {
 		select {
 		case client := <-h.register:
-			// 클라이언트 등록
-			if !h.registerClient(client) {
-				// 닉네임 중복
-				client.sendSystemMessage("error_message", "이미 사용 중인 닉네임입니다.")
-				close(client.Send) // 클라이언트 종료 처리
-			} else {
-				client.sendSystemMessage("system_message", "서버에 성공적으로 연결되었습니다.")
-			}
-
+			h.connections[client] = true
 		case client := <-h.unregister:
-			// 클라이언트 등록 해제
-			h.unregisterClient(client)
-
-		case dm := <-h.directMessage:
-			// 1:1 메시지 처리
-			h.handleDirectMessage(dm)
-
-		case client := <-h.listRooms:
-			h.handleListRooms(client)
+			if _, ok := h.connections[client]; ok {
+				if client.AuthInfo != nil {
+					delete(h.authenticatedClients, client.AuthInfo.UserID)
+				}
+				delete(h.connections, client)
+				close(client.Send)
+			}
+		case request := <-h.messages:
+			h.handleMessage(request)
 		}
 	}
 }
 
-// HandleNewClient handler로부터 새 연결을 받아 클라이언트를 생성하고 실행합니다.
-func (h *Hub) HandleNewClient(conn *websocket.Conn, nickname string) {
-	// 1. 새 클라이언트 생성
-	client := &Client{
-		ID:       uuid.NewString(),
-		Nickname: nickname,
-		Hub:      h,
-		Conn:     conn,
-		Send:     make(chan []byte, 256),
-	}
-
-	// 2. Hub의 Run() 루프에 등록 요청
+func (h *Hub) ServeWs(conn *websocket.Conn) {
+	client := &Client{Hub: h, Conn: conn, Send: make(chan []byte, 256)}
 	h.register <- client
-
-	// 3. 클라이언트의 고루틴 실행
 	go client.writePump()
 	go client.readPump()
 }
 
-// registerClient Hub에 클라이언트를 등록합니다. 닉네임 중복 시 false 반환.
-func (h *Hub) registerClient(client *Client) bool {
-	h.clientsMu.Lock()
-	defer h.clientsMu.Unlock()
-
-	if _, exists := h.clients[client.Nickname]; exists {
-		log.Printf("Nickname conflict: %s", client.Nickname)
-		return false // 닉네임 중복
-	}
-
-	h.clients[client.Nickname] = client
-	log.Printf("Client registered: %s (ID: %s)", client.Nickname, client.ID)
-	return true
-}
-
-// unregisterClient Hub에서 클라이언트를 등록 해제합니다.
-func (h *Hub) unregisterClient(client *Client) {
-	h.clientsMu.Lock()
-	// Remove the client from the central map
-	if _, ok := h.clients[client.Nickname]; ok {
-		delete(h.clients, client.Nickname)
-		close(client.Send)
-		log.Printf("Client unregistered: %s", client.Nickname)
-	} else {
-		h.clientsMu.Unlock()
+func (h *Hub) handleMessage(req *ClientRequest) {
+	switch req.Message.Type {
+	case "register":
+		h.handleRegister(req)
 		return
-	}
-	h.clientsMu.Unlock()
-
-	// Remove the client from all rooms they might have joined
-	h.roomsMu.RLock()
-	defer h.roomsMu.RUnlock()
-	for _, room := range h.rooms {
-		room.removeClient(client)
-	}
-}
-
-// handleDirectMessage DM을 찾아 수신자에게 전송합니다.
-func (h *Hub) handleDirectMessage(dm *DirectMessage) {
-	h.clientsMu.RLock()
-	recipient, ok := h.clients[dm.RecipientNickname]
-	h.clientsMu.RUnlock()
-
-	// 수신자가 온라인 상태인지 확인
-	if !ok {
-		log.Printf("DM Failed: Recipient '%s' not found.", dm.RecipientNickname)
-
-		// 발신자에게 에러 메시지 전송
-		h.clientsMu.RLock()
-		sender, senderOk := h.clients[dm.SenderNickname]
-		h.clientsMu.RUnlock()
-		if senderOk {
-			sender.sendSystemMessage("error_message", fmt.Sprintf("'%s'님을 찾을 수 없습니다.", dm.RecipientNickname))
-		}
+	case "login":
+		h.handleLogin(req)
 		return
 	}
 
-	// 수신자에게 보낼 메시지 페이로드 생성
-	payload := domain.DirectMessagePayload{
-		Sender:    dm.SenderNickname,
-		Content:   dm.Content,
-		Timestamp: time.Now(),
-	}
-	respMsg := domain.WebSocketMessage{
-		Type:    "new_direct_message",
-		Payload: payload,
-	}
-	jsonMsg, err := json.Marshal(respMsg)
-	if err != nil {
-		log.Printf("DM Marshal error: %v", err)
+	if req.Client.AuthInfo == nil {
+		req.Client.sendSystemMessage("error_message", "Authentication required.")
 		return
 	}
 
-	// 수신자의 Send 채널로 메시지 전송
-	select {
-	case recipient.Send <- jsonMsg:
-		log.Printf("DM Sent: %s -> %s", dm.SenderNickname, dm.RecipientNickname)
+	switch req.Message.Type {
+	case "send_direct_message":
+		h.handleSendDirectMessage(req)
+	case "create_room":
+		h.handleCreateRoom(req)
+	case "join_room":
+		h.handleJoinRoom(req)
+	case "leave_room":
+		h.handleLeaveRoom(req)
+	case "list_rooms":
+		h.handleListRooms(req)
+	case "list_members":
+		h.handleListMembers(req)
+	case "send_room_message":
+		h.handleSendRoomMessage(req)
 	default:
-		// 수신자의 채널이 꽉 찼거나 닫힌 경우
-		log.Printf("DM Failed: Recipient '%s' channel is full or closed.", dm.RecipientNickname)
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Unknown message type: %s", req.Message.Type))
 	}
 }
 
-// handleListRooms sends the list of rooms to a client.
-func (h *Hub) handleListRooms(client *Client) {
-	h.roomsMu.RLock()
-	defer h.roomsMu.RUnlock()
-
-	roomInfos := make([]domain.RoomInfo, 0, len(h.rooms))
-	for _, room := range h.rooms {
-		roomInfos = append(roomInfos, domain.RoomInfo{ID: room.ID, Name: room.Name})
+// ... Auth handlers ...
+func (h *Hub) handleRegister(req *ClientRequest) {
+	var payload domain.RegisterPayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid register payload.")
+		return
 	}
-
-	payload := domain.RoomListPayload{Rooms: roomInfos}
-	resp := domain.WebSocketMessage{Type: "room_list", Payload: payload}
-
-	jsonMsg, err := json.Marshal(resp)
+	user, err := h.userService.Register(payload.Nickname, payload.Password)
 	if err != nil {
-		log.Printf("Failed to marshal room list: %v", err)
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Registration failed: %v", err))
+		return
+	}
+	h.authenticateClient(req.Client, user)
+}
+
+func (h *Hub) handleLogin(req *ClientRequest) {
+	var payload domain.LoginPayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid login payload.")
+		return
+	}
+	user, err := h.userService.Login(payload.Nickname, payload.Password)
+	if err != nil {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Login failed: %v", err))
+		return
+	}
+	h.authenticateClient(req.Client, user)
+}
+
+func (h *Hub) authenticateClient(client *Client, user *domain.User) {
+	if existingClient, ok := h.authenticatedClients[user.ID]; ok {
+		existingClient.sendSystemMessage("error_message", "You have been logged in from another location.")
+		close(existingClient.Send)
+	}
+	client.AuthInfo = &Auth{UserID: user.ID, Nickname: user.Nickname}
+	h.authenticatedClients[user.ID] = client
+
+	// Send login success message
+	loginSuccessPayload := domain.LoginSuccessPayload{UserID: user.ID, Nickname: user.Nickname}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "login_success", Payload: loginSuccessPayload})
+	client.Send <- msg
+
+	// Send user their existing room memberships synchronously
+	h.syncUserRooms(client)
+}
+
+func (h *Hub) syncUserRooms(client *Client) {
+	if client.AuthInfo == nil {
+		return
+	}
+	rooms, err := h.roomService.GetUserRooms(client.AuthInfo.UserID)
+	if err != nil {
+		log.Printf("error syncing user rooms: %v", err)
 		return
 	}
 
-	client.Send <- jsonMsg
+	for _, room := range rooms {
+		joinSuccessPayload := domain.JoinSuccessPayload{RoomID: room.ID.String(), RoomName: room.Name}
+		msg, _ := json.Marshal(domain.WebSocketMessage{Type: "join_success", Payload: joinSuccessPayload})
+		client.Send <- msg
+	}
 }
 
-// createRoom creates a new room.
-func (h *Hub) createRoom(name, password string, client *Client) {
-	h.roomsMu.Lock()
-	defer h.roomsMu.Unlock()
+// --- Message Handlers ---
 
-	// Check if room name already exists.
-	for _, room := range h.rooms {
-		if room.Name == name {
-			client.sendSystemMessage("error_message", fmt.Sprintf("Room name '%s' is already taken.", name))
-			return
+func (h *Hub) handleSendDirectMessage(req *ClientRequest) {
+	var payload domain.SendDirectMessagePayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid DM payload.")
+		return
+	}
+	recipientUser, err := h.userService.GetUserByNickname(payload.RecipientNickname)
+	if err != nil || recipientUser == nil {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("User '%s' not found.", payload.RecipientNickname))
+		return
+	}
+	convoID := generateDMConversationID(req.Client.AuthInfo.UserID, recipientUser.ID)
+	chatMsg := &domain.ChatMessage{ConversationID: convoID, SenderID: req.Client.AuthInfo.UserID.String(), SenderNickname: req.Client.AuthInfo.Nickname, Content: payload.Content, Timestamp: time.Now()}
+	h.messageRepo.SaveMessage(context.Background(), chatMsg)
+	if recipientClient, ok := h.authenticatedClients[recipientUser.ID]; ok {
+		dmPayload := domain.DirectMessagePayload{Sender: req.Client.AuthInfo.Nickname, Content: payload.Content, Timestamp: chatMsg.Timestamp}
+		msg, _ := json.Marshal(domain.WebSocketMessage{Type: "new_direct_message", Payload: dmPayload})
+		recipientClient.Send <- msg
+	}
+}
+
+func (h *Hub) handleCreateRoom(req *ClientRequest) {
+	var payload domain.CreateRoomPayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid create_room payload.")
+		return
+	}
+	user := &domain.User{ID: req.Client.AuthInfo.UserID, Nickname: req.Client.AuthInfo.Nickname}
+	room, err := h.roomService.CreateRoom(payload.Name, payload.Password, user)
+	if err != nil {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Failed to create room: %v", err))
+		return
+	}
+	joinSuccessPayload := domain.JoinSuccessPayload{RoomID: room.ID.String(), RoomName: room.Name}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "join_success", Payload: joinSuccessPayload})
+	req.Client.Send <- msg
+}
+
+func (h *Hub) handleJoinRoom(req *ClientRequest) {
+	var payload domain.JoinRoomPayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid join_room payload.")
+		return
+	}
+	user := &domain.User{ID: req.Client.AuthInfo.UserID}
+	room, err := h.roomService.JoinRoom(payload.RoomName, payload.Password, user)
+	if err != nil {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Failed to join room: %v", err))
+		return
+	}
+	joinSuccessPayload := domain.JoinSuccessPayload{RoomID: room.ID.String(), RoomName: room.Name}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "join_success", Payload: joinSuccessPayload})
+	req.Client.Send <- msg
+}
+
+func (h *Hub) handleLeaveRoom(req *ClientRequest) {
+	var payload domain.LeaveRoomPayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid leave_room payload.")
+		return
+	}
+	user := &domain.User{ID: req.Client.AuthInfo.UserID}
+	room, err := h.roomService.LeaveRoom(payload.RoomName, user)
+	if err != nil {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Failed to leave room: %v", err))
+		return
+	}
+	leaveSuccessPayload := domain.LeaveSuccessPayload{RoomID: room.ID.String()}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "leave_success", Payload: leaveSuccessPayload})
+	req.Client.Send <- msg
+}
+
+func (h *Hub) handleListRooms(req *ClientRequest) {
+	rooms, err := h.roomService.ListRooms()
+	if err != nil {
+		req.Client.sendSystemMessage("error_message", "Failed to retrieve room list.")
+		return
+	}
+	roomInfos := make([]domain.RoomInfo, len(rooms))
+	for i, r := range rooms {
+		roomInfos[i] = domain.RoomInfo{ID: r.ID.String(), Name: r.Name}
+	}
+	payload := domain.RoomListPayload{Rooms: roomInfos}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "room_list", Payload: payload})
+	req.Client.Send <- msg
+}
+
+func (h *Hub) handleListMembers(req *ClientRequest) {
+	var payload domain.ListMembersPayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid list_members payload.")
+		return
+	}
+	members, err := h.roomService.GetRoomMembers(payload.RoomName)
+	if err != nil {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("Failed to get members for room '%s': %v", payload.RoomName, err))
+		return
+	}
+	membersPayload := domain.RoomMembersPayload{RoomName: payload.RoomName, Members: members}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "room_members", Payload: membersPayload})
+	req.Client.Send <- msg
+}
+
+func (h *Hub) handleSendRoomMessage(req *ClientRequest) {
+	var payload domain.SendRoomMessagePayload
+	if err := parsePayload(req.Message.Payload, &payload); err != nil {
+		req.Client.sendSystemMessage("error_message", "Invalid room message payload.")
+		return
+	}
+
+	user := &domain.User{ID: req.Client.AuthInfo.UserID}
+	isMember, err := h.roomService.IsRoomMember(payload.RoomName, user)
+	if err != nil || !isMember {
+		req.Client.sendSystemMessage("error_message", fmt.Sprintf("You are not a member of room '%s'.", payload.RoomName))
+		return
+	}
+
+	room, err := h.roomService.GetRoomByName(payload.RoomName)
+	if err != nil || room == nil {
+		req.Client.sendSystemMessage("error_message", "Room not found.")
+		return
+	}
+
+	// Save to DB
+	chatMsg := &domain.ChatMessage{ConversationID: room.ID.String(), SenderID: req.Client.AuthInfo.UserID.String(), SenderNickname: req.Client.AuthInfo.Nickname, Content: payload.Content, Timestamp: time.Now()}
+	h.messageRepo.SaveMessage(context.Background(), chatMsg)
+
+	// Broadcast to online members
+	roomMsgPayload := domain.RoomMessagePayload{RoomName: payload.RoomName, SenderNickname: req.Client.AuthInfo.Nickname, Content: payload.Content, Timestamp: chatMsg.Timestamp}
+	msg, _ := json.Marshal(domain.WebSocketMessage{Type: "room_message", Payload: roomMsgPayload})
+
+	memberIDs, err := h.roomService.GetRoomMemberIDs(room.Name)
+	if err != nil {
+		return
+	}
+
+	for _, memberID := range memberIDs {
+		// Don't send the message back to the original sender
+		if memberID == req.Client.AuthInfo.UserID {
+			continue
+		}
+		if onlineClient, ok := h.authenticatedClients[memberID]; ok {
+			onlineClient.Send <- msg
 		}
 	}
-
-	room := NewRoom(name, password, h)
-	h.rooms[room.ID] = room
-
-	// Automatically join the creator to the room.
-	room.addClient(client)
-
-	log.Printf("Room created: %s (ID: %s) by %s", name, room.ID, client.Nickname)
-	client.sendSystemMessage("system_message", fmt.Sprintf("Room '%s' created successfully.", name))
-
-	// Send join success message
-	joinPayload := domain.JoinSuccessPayload{RoomID: room.ID, RoomName: room.Name}
-	resp := domain.WebSocketMessage{Type: "join_success", Payload: joinPayload}
-	if jsonMsg, err := json.Marshal(resp); err == nil {
-		client.Send <- jsonMsg
-	} else {
-		log.Printf("Failed to marshal join_success message: %v", err)
-	}
 }
 
-// joinRoom adds a client to a room.
-func (h *Hub) joinRoom(roomID, password string, client *Client) {
-	h.roomsMu.RLock()
-	room, ok := h.rooms[roomID]
-	h.roomsMu.RUnlock()
+// --- Helper Functions ---
 
-	if !ok {
-		client.sendSystemMessage("error_message", "Room not found.")
-		return
-	}
-
-	if room.Password != password {
-		client.sendSystemMessage("error_message", "Invalid password.")
-		return
-	}
-
-	room.addClient(client)
-
-	log.Printf("Client %s joined room %s", client.Nickname, room.Name)
-
-	// Send join success message
-	payload := domain.JoinSuccessPayload{RoomID: room.ID, RoomName: room.Name}
-	resp := domain.WebSocketMessage{Type: "join_success", Payload: payload}
-	if jsonMsg, err := json.Marshal(resp); err == nil {
-		client.Send <- jsonMsg
-	} else {
-		log.Printf("Failed to marshal join_success message: %v", err)
-	}
-}
-
-// leaveRoom removes a client from a room.
-func (h *Hub) leaveRoom(roomID string, client *Client) {
-	h.roomsMu.RLock()
-	room, ok := h.rooms[roomID]
-	h.roomsMu.RUnlock()
-
-	if !ok {
-		client.sendSystemMessage("error_message", "Room not found.")
-		return
-	}
-
-	room.removeClient(client)
-
-	log.Printf("Client %s left room %s", client.Nickname, room.Name)
-
-	// Send leave success message
-	payload := domain.LeaveSuccessPayload{RoomID: room.ID}
-	resp := domain.WebSocketMessage{Type: "leave_success", Payload: payload}
-	if jsonMsg, err := json.Marshal(resp); err == nil {
-		client.Send <- jsonMsg
-	} else {
-		log.Printf("Failed to marshal leave_success message: %v", err)
-	}
-}
-
-// handleRoomMessage broadcasts a message to a room.
-func (h *Hub) handleRoomMessage(roomID, content string, client *Client) {
-	h.roomsMu.RLock()
-	room, ok := h.rooms[roomID]
-	h.roomsMu.RUnlock()
-
-	if !ok {
-		client.sendSystemMessage("error_message", "Room not found.")
-		return
-	}
-
-	// Check if the client is in the room.
-	if !room.hasClient(client) {
-		client.sendSystemMessage("error_message", "You are not in this room.")
-		return
-	}
-
-	payload := domain.RoomMessagePayload{
-		RoomID:    roomID,
-		Sender:    client.Nickname,
-		Content:   content,
-		Timestamp: time.Now(),
-	}
-
-	resp := domain.WebSocketMessage{Type: "room_message", Payload: payload}
-	jsonMsg, err := json.Marshal(resp)
+func parsePayload(payload interface{}, result interface{}) error {
+	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("Failed to marshal room message: %v", err)
-		return
+		return errors.New("failed to marshal payload")
 	}
+	return json.Unmarshal(payloadBytes, result)
+}
 
-	room.broadcast(jsonMsg, client)
+func generateDMConversationID(userID1, userID2 uuid.UUID) string {
+	ids := []string{userID1.String(), userID2.String()}
+	sort.Strings(ids)
+	return strings.Join(ids, "_")
 }

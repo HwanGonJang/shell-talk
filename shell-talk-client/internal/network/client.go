@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -19,8 +18,7 @@ import (
 
 // Conversation holds the state of a single chat (DM or Room).
 type Conversation struct {
-	ID      string // Nickname for DMs, RoomID for rooms
-	Name    string
+	ID      string // Nickname for DMs, Room Name for rooms
 	Type    string // "DM" or "ROOM"
 	Joined  bool   // Only relevant for rooms
 	History []string
@@ -31,32 +29,28 @@ type Conversation struct {
 type Client struct {
 	Conn                *websocket.Conn
 	Send                chan WebSocketMessage
-	Nickname            string
+	AuthInfo            *LoginSuccessPayload // Populated after successful login
+	AuthCh              chan bool            // Signals successful authentication
 	conversations       map[string]*Conversation
 	currentConversation *Conversation
 	mu                  sync.RWMutex
 }
 
-var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
 // NewClient creates a new network client.
 func NewClient() *Client {
 	return &Client{
 		Send:          make(chan WebSocketMessage, 256),
+		AuthCh:        make(chan bool),
 		conversations: make(map[string]*Conversation),
 	}
 }
 
 // Connect establishes a WebSocket connection to the server.
-func (c *Client) Connect(serverURL string, nickname string) error {
-	c.Nickname = nickname
+func (c *Client) Connect(serverURL string) error {
 	u, err := url.Parse(serverURL)
 	if err != nil {
 		return err
 	}
-	q := u.Query()
-	q.Set("nickname", nickname)
-	u.RawQuery = q.Encode()
 
 	log.Printf("Connecting to %s...", u.String())
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
@@ -96,11 +90,10 @@ func (c *Client) writePump() {
 	}
 }
 
-// HandleStdin is the main loop for reading user input.
+// HandleStdin is the main loop for reading user input post-authentication.
 func (c *Client) HandleStdin() {
 	reader := bufio.NewReader(os.Stdin)
-	time.Sleep(500 * time.Millisecond) // Wait for initial messages
-	c.updateView()
+	c.redrawView()
 
 	for {
 		input, _ := reader.ReadString('\n')
@@ -125,7 +118,7 @@ func (c *Client) handleCommand(input string) {
 
 	switch command {
 	case "/help":
-		c.updateView()
+		c.redrawView()
 		return
 	case "/create":
 		if len(parts) < 3 {
@@ -135,15 +128,21 @@ func (c *Client) handleCommand(input string) {
 		}
 	case "/join":
 		if len(parts) < 3 {
-			c.printToScreen("[ERROR] Usage: /join <room_id> <password>")
+			c.printToScreen("[ERROR] Usage: /join <room_name> <password>")
 		} else {
-			c.Send <- WebSocketMessage{Type: "join_room", Payload: JoinRoomPayload{RoomID: parts[1], Password: strings.Join(parts[2:], " ")}}
+			c.Send <- WebSocketMessage{Type: "join_room", Payload: JoinRoomPayload{RoomName: parts[1], Password: strings.Join(parts[2:], " ")}}
 		}
 	case "/leave":
 		if len(parts) < 2 {
-			c.printToScreen("[ERROR] Usage: /leave <room_id>")
+			c.printToScreen("[ERROR] Usage: /leave <room_name>")
 		} else {
-			c.Send <- WebSocketMessage{Type: "leave_room", Payload: LeaveRoomPayload{RoomID: parts[1]}}
+			c.Send <- WebSocketMessage{Type: "leave_room", Payload: LeaveRoomPayload{RoomName: parts[1]}}
+		}
+	case "/members":
+		if len(parts) < 2 {
+			c.printToScreen("[ERROR] Usage: /members <room_name>")
+		} else {
+			c.Send <- WebSocketMessage{Type: "list_members", Payload: ListMembersPayload{RoomName: parts[1]}}
 		}
 	case "/list":
 		c.Send <- WebSocketMessage{Type: "list_rooms"}
@@ -151,27 +150,27 @@ func (c *Client) handleCommand(input string) {
 		c.listMyRooms()
 		return
 	case "/switch":
-		if len(parts) < 2 {
-			c.printToScreen("[ERROR] Usage: /switch <context_id>")
+		if len(parts) < 3 {
+			c.printToScreen("[ERROR] Usage: /switch <dm|room> <name>")
 			return
 		}
-		if err := c.switchConversation(parts[1]); err != nil {
+		convType, name := parts[1], parts[2]
+		if err := c.switchConversation(convType, name); err != nil {
 			c.printToScreen(fmt.Sprintf("[ERROR] %s", err.Error()))
 		} else {
-			c.updateView()
+			c.redrawView()
 		}
 		return
 	case "/exit":
 		c.mu.Lock()
 		c.currentConversation = nil
 		c.mu.Unlock()
-		c.updateView()
+		c.redrawView()
 		return
 	default:
 		c.printToScreen(fmt.Sprintf("[ERROR] Unknown command: %s", command))
 	}
 
-	// For commands that don't manage their own UI update, just show a prompt
 	c.prompt()
 }
 
@@ -181,7 +180,7 @@ func (c *Client) handleChatMessage(input string) {
 	c.mu.RUnlock()
 
 	if conv == nil {
-		c.printToScreen("[ERROR] Not in a conversation. Use /switch <id> or /list.")
+		c.printToScreen("[ERROR] Not in a conversation. Use /switch <dm|room> <name>.")
 		return
 	}
 
@@ -189,76 +188,64 @@ func (c *Client) handleChatMessage(input string) {
 	switch conv.Type {
 	case "DM":
 		msgType = "send_direct_message"
-		c.Send <- WebSocketMessage{Type: msgType, Payload: SendDirectMessagePayload{Recipient: conv.ID, Content: input}}
+		c.Send <- WebSocketMessage{Type: msgType, Payload: SendDirectMessagePayload{RecipientNickname: conv.ID, Content: input}}
 	case "ROOM":
 		msgType = "send_room_message"
-		c.Send <- WebSocketMessage{Type: msgType, Payload: SendRoomMessagePayload{RoomID: conv.ID, Content: input}}
+		c.Send <- WebSocketMessage{Type: msgType, Payload: SendRoomMessagePayload{RoomName: conv.ID, Content: input}}
 	}
 
 	formattedMsg := fmt.Sprintf("[%s] [Me]: %s", time.Now().Format("15:04:05"), input)
 	conv.addHistory(formattedMsg)
-	c.updateView()
+	c.printToScreen(formattedMsg)
 }
 
 func (c *Client) handleServerMessage(msg WebSocketMessage) {
 	payloadBytes, _ := json.Marshal(msg.Payload)
 	timestamp := time.Now().Format("15:04:05")
-	var output, contextID, convType, convName string
 
 	switch msg.Type {
+	case "login_success":
+		var payload LoginSuccessPayload
+		_ = json.Unmarshal(payloadBytes, &payload)
+		c.AuthInfo = &payload
+		fmt.Printf("\r[SYSTEM] Welcome, %s! Login successful.\n", payload.Nickname)
+		c.AuthCh <- true
+		return
+
 	case "new_direct_message":
 		var payload map[string]interface{}
 		_ = json.Unmarshal(payloadBytes, &payload)
 		sender := payload["sender"].(string)
 		content := payload["content"].(string)
-		contextID, convType, convName = sender, "DM", sender
-		output = fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content)
+		conv := c.getOrCreateConversation(sender, "DM")
+		formattedMsg := fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content)
+		conv.addHistory(formattedMsg)
+		c.notifyOrUpdate(sender, "DM", formattedMsg)
 
 	case "room_message":
 		var payload map[string]interface{}
 		_ = json.Unmarshal(payloadBytes, &payload)
-		roomID := payload["room_id"].(string)
-		sender := payload["sender"].(string)
+		roomName := payload["room_name"].(string)
+		sender := payload["sender_nickname"].(string)
 		content := payload["content"].(string)
-		contextID, convType, convName = roomID, "ROOM", roomID
-		output = fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content)
+		conv := c.getOrCreateConversation(roomName, "ROOM")
+		formattedMsg := fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content)
+		conv.addHistory(formattedMsg)
+		c.notifyOrUpdate(roomName, "ROOM", formattedMsg)
 
 	case "join_success":
 		var payload JoinSuccessPayload
 		_ = json.Unmarshal(payloadBytes, &payload)
-		conv := c.getOrCreateConversation(payload.RoomID, "ROOM", payload.RoomName)
+		conv := c.getOrCreateConversation(payload.RoomName, "ROOM")
 		conv.mu.Lock()
 		conv.Joined = true
-		conv.Name = payload.RoomName // Ensure name is updated
 		conv.mu.Unlock()
 		c.printToScreen(fmt.Sprintf("[SYSTEM] Successfully joined room: %s", payload.RoomName))
-		return
 
 	case "leave_success":
 		var payload LeaveSuccessPayload
 		_ = json.Unmarshal(payloadBytes, &payload)
-		c.mu.RLock()
-		conv, exists := c.conversations[payload.RoomID]
-		c.mu.RUnlock()
-		if exists {
-			conv.mu.Lock()
-			conv.Joined = false
-			conv.mu.Unlock()
-		}
-		c.printToScreen(fmt.Sprintf("[SYSTEM] Successfully left room: %s", payload.RoomID))
-		return
-
-	case "system_message", "error_message":
-		var payload map[string]interface{}
-		_ = json.Unmarshal(payloadBytes, &payload)
-		content := payload["content"].(string)
-		prefix := "[SYSTEM]"
-		if msg.Type == "error_message" {
-			prefix = "[SERVER ERROR]"
-		}
-		output = fmt.Sprintf("[%s] %s: %s", timestamp, prefix, content)
-		c.printToScreen(output)
-		return
+		c.printToScreen(fmt.Sprintf("[SYSTEM] Successfully left a room."))
 
 	case "room_list":
 		var payload RoomListPayload
@@ -269,92 +256,100 @@ func (c *Client) handleServerMessage(msg WebSocketMessage) {
 			builder.WriteString("  No rooms available.")
 		} else {
 			for _, room := range payload.Rooms {
-				builder.WriteString(fmt.Sprintf("  - %s (ID: %s)\n", room.Name, room.ID))
-				c.getOrCreateConversation(room.ID, "ROOM", room.Name)
+				builder.WriteString(fmt.Sprintf("  - %s\n", room.Name))
+				c.getOrCreateConversation(room.Name, "ROOM")
 			}
 		}
 		c.printToScreen(builder.String())
-		return
+
+	case "room_members":
+		var payload RoomMembersPayload
+		_ = json.Unmarshal(payloadBytes, &payload)
+		var builder strings.Builder
+		builder.WriteString(fmt.Sprintf("\r[%s] [Members of %s]:\n", timestamp, payload.RoomName))
+		for _, member := range payload.Members {
+			builder.WriteString(fmt.Sprintf("  - %s\n", member))
+		}
+		c.printToScreen(builder.String())
+
+	case "error_message", "system_message":
+		var payload map[string]interface{}
+		_ = json.Unmarshal(payloadBytes, &payload)
+		content := payload["content"].(string)
+		prefix := "[SYSTEM]"
+		if msg.Type == "error_message" {
+			prefix = "[ERROR]"
+		}
+		c.printToScreen(fmt.Sprintf("%s %s", prefix, content))
 
 	default:
-		c.printToScreen(fmt.Sprintf("[%s] [UNKNOWN]: %v", timestamp, msg))
-		return
-	}
-
-	if contextID != "" {
-		conv := c.getOrCreateConversation(contextID, convType, convName)
-		conv.addHistory(output)
-
-		c.mu.RLock()
-		isCurrent := c.currentConversation != nil && c.currentConversation.ID == contextID
-		c.mu.RUnlock()
-
-		if isCurrent {
-			c.updateView()
-		} else {
-			notification := fmt.Sprintf("New message from %s", conv.Name)
-			c.printToScreen(notification)
-		}
+		c.printToScreen(fmt.Sprintf("[UNKNOWN] %v", msg))
 	}
 }
 
-// getOrCreateConversation_internal is a helper that assumes the caller holds the necessary lock.
-func (c *Client) getOrCreateConversation_internal(id, convType, name string) *Conversation {
-	if conv, exists := c.conversations[id]; exists {
-		if conv.Name == conv.ID && name != id {
-			conv.Name = name
-		}
+func (c *Client) getOrCreateConversation(name string, convType string) *Conversation {
+	key := convType + "_" + name
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if conv, exists := c.conversations[key]; exists {
 		return conv
 	}
-	conv := &Conversation{ID: id, Type: convType, Name: name, History: []string{}}
-	c.conversations[id] = conv
+	conv := &Conversation{ID: name, Type: convType, History: []string{}}
+	c.conversations[key] = conv
 	return conv
 }
 
-// getOrCreateConversation acquires a lock and creates a conversation.
-func (c *Client) getOrCreateConversation(id, convType, name string) *Conversation {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.getOrCreateConversation_internal(id, convType, name)
-}
-
-func (c *Client) switchConversation(contextID string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	conv, exists := c.conversations[contextID]
-	if exists {
-		conv.mu.RLock()
-		convType, convJoined := conv.Type, conv.Joined
-		conv.mu.RUnlock()
-
-		if convType == "ROOM" && !convJoined {
-			return fmt.Errorf("you have not joined room '%s'. Use /join first", conv.Name)
-		}
-		c.currentConversation = conv
-		return nil
-	} else {
-		if uuidRegex.MatchString(contextID) {
-			return fmt.Errorf("unknown room ID: %s. Use /list to see available rooms", contextID)
-		}
-		c.currentConversation = c.getOrCreateConversation_internal(contextID, "DM", contextID)
-		return nil
+func (c *Client) switchConversation(convType, name string) error {
+	convType = strings.ToUpper(convType)
+	if convType != "DM" && convType != "ROOM" {
+		return fmt.Errorf("invalid switch type: must be 'dm' or 'room'")
 	}
+
+	key := convType + "_" + name
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	conv, exists := c.conversations[key]
+	if convType == "ROOM" {
+		if !exists {
+			return fmt.Errorf("unknown room: %s. Use /list to see available rooms", name)
+		}
+		conv.mu.RLock()
+		joined := conv.Joined
+		conv.mu.RUnlock()
+		if !joined {
+			return fmt.Errorf("you have not joined room '%s'. Use /join first", name)
+		}
+	}
+
+	if !exists {
+		conv = c.getOrCreateConversation_internal(name, convType)
+	}
+
+	c.currentConversation = conv
+	return nil
 }
 
-// updateView is the single source of truth for rendering the UI.
-func (c *Client) updateView() {
+func (c *Client) getOrCreateConversation_internal(name, convType string) *Conversation {
+	key := convType + "_" + name
+	if conv, exists := c.conversations[key]; exists {
+		return conv
+	}
+	conv := &Conversation{ID: name, Type: convType, History: []string{}}
+	c.conversations[key] = conv
+	return conv
+}
+
+func (c *Client) redrawView() {
 	clearScreen()
 	c.mu.RLock()
 	conv := c.currentConversation
 	c.mu.RUnlock()
 
 	if conv == nil {
-		// We are in the lobby
 		c.printHelp()
 	} else {
-		// We are in a conversation
-		fmt.Printf("--- Conversation with %s (%s) ---\n", conv.Name, conv.Type)
+		fmt.Printf("--- Conversation with %s (%s) ---\n", conv.ID, conv.Type)
 		conv.mu.RLock()
 		for _, msg := range conv.History {
 			fmt.Println(msg)
@@ -372,13 +367,16 @@ func (c *Client) listMyRooms() {
 	builder.WriteString(fmt.Sprintf("\r[%s] [My Joined Rooms]:\n", time.Now().Format("15:04:05")))
 
 	found := false
-	for _, conv := range c.conversations {
-		conv.mu.RLock()
-		if conv.Type == "ROOM" && conv.Joined {
-			builder.WriteString(fmt.Sprintf("  - %s (ID: %s)\n", conv.Name, conv.ID))
-			found = true
+	for key, conv := range c.conversations {
+		if strings.HasPrefix(key, "ROOM_") {
+			conv.mu.RLock()
+			joined := conv.Joined
+			conv.mu.RUnlock()
+			if joined {
+				builder.WriteString(fmt.Sprintf("  - %s\n", conv.ID))
+				found = true
+			}
 		}
-		conv.mu.RUnlock()
 	}
 
 	if !found {
@@ -394,13 +392,34 @@ func (c *Client) printToScreen(msg string) {
 
 func (c *Client) prompt() {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	prompt := "[Lobby] > "
-	if c.currentConversation != nil {
-		prompt = fmt.Sprintf("[%s] > ", c.currentConversation.Name)
+	prompt := "[Auth] > "
+	if c.AuthInfo != nil {
+		if c.currentConversation != nil {
+			prompt = fmt.Sprintf("[%s] > ", c.currentConversation.ID)
+		} else {
+			prompt = "[Lobby] > "
+		}
 	}
+	c.mu.RUnlock()
 	fmt.Print(prompt)
+}
+
+func (c *Client) notifyOrUpdate(name, convType, message string) {
+	key := convType + "_" + name
+	c.mu.RLock()
+	isCurrent := false
+	if c.currentConversation != nil {
+		currentKey := c.currentConversation.Type + "_" + c.currentConversation.ID
+		isCurrent = (currentKey == key)
+	}
+	inLobby := c.currentConversation == nil
+	c.mu.RUnlock()
+
+	if isCurrent {
+		c.printToScreen(message)
+	} else if inLobby {
+		c.printToScreen(fmt.Sprintf("New message in %s (%s)", name, convType))
+	}
 }
 
 func (c *Client) printHelp() {
@@ -408,10 +427,12 @@ func (c *Client) printHelp() {
 	fmt.Println("  /help                  - Show this help message")
 	fmt.Println("  /list                  - List all available rooms")
 	fmt.Println("  /myrooms               - List rooms you have joined")
-	fmt.Println("  /create <name> <pass>  - Create a new room (and auto-join)")
-	fmt.Println("  /join <id> <pass>      - Join a room")
-	fmt.Println("  /leave <id>            - Leave a room")
-	fmt.Println("  /switch <id>           - Switch to a conversation (room ID or user nickname)")
+	fmt.Println("  /create <name> <pass>  - Create a new room")
+	fmt.Println("  /join <name> <pass>    - Join a room by its name")
+	fmt.Println("  /leave <name>          - Leave a room by its name")
+	fmt.Println("  /members <name>        - List members of a room")
+	fmt.Println("  /switch dm <nickname>  - Switch to a DM conversation")
+	fmt.Println("  /switch room <name>    - Switch to a room conversation")
 	fmt.Println("  /exit                  - Exit the current conversation to the lobby")
 }
 
@@ -431,7 +452,6 @@ func clearScreen() {
 	cmd.Stdout = os.Stdout
 	err := cmd.Run()
 	if err != nil {
-		// Fallback if clear command fails
-		fmt.Print("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+		fmt.Print(strings.Repeat("\n", 50))
 	}
 }
