@@ -1,17 +1,50 @@
 package network
 
-// WebSocketMessage WebSocketMessage는 서버와 통신하는 표준 포맷입니다.
-// (서버의 domain/message.go와 일치해야 함)
+import (
+	"github.com/google/uuid"
+)
+
+// WebSocketMessage is the standard communication format.
 type WebSocketMessage struct {
 	Type    string      `json:"type"`
 	Payload interface{} `json:"payload"`
 }
 
-// SendDirectMessagePayload SendDirectMessagePayload는 'send_direct_message' 요청의 페이로드입니다.
-type SendDirectMessagePayload struct {
-	Recipient string `json:"recipient"`
-	Content   string `json:"content"`
+// --- Authentication Payloads ---
+
+// RegisterPayload is the payload for the 'register' message.
+type RegisterPayload struct {
+	Nickname string `json:"nickname"`
+	Password string `json:"password"`
 }
+
+// LoginPayload is the payload for the 'login' message.
+type LoginPayload struct {
+	Nickname string `json:"nickname"`
+	Password string `json:"password"`
+}
+
+// LoginSuccessPayload is the payload for the 'login_success' message.
+type LoginSuccessPayload struct {
+	UserID   uuid.UUID `json:"user_id"`
+	Nickname string    `json:"nickname"`
+}
+
+// --- DM & Room Message Payloads ---
+
+// SendDirectMessagePayload is the payload for the 'send_direct_message' request.
+type SendDirectMessagePayload struct {
+	RecipientNickname string `json:"recipient_nickname"`
+	Content           string `json:"content"`
+}
+
+// SendRoomMessagePayload is the payload for the 'send_room_message' message.
+type SendRoomMessagePayload struct {
+	RoomName string `json:"room_name"`
+	Content  string `json:"content"`
+}
+
+// --- Room Management Payloads ---
 
 // CreateRoomPayload is the payload for the 'create_room' message.
 type CreateRoomPayload struct {
@@ -21,24 +54,29 @@ type CreateRoomPayload struct {
 
 // JoinRoomPayload is the payload for the 'join_room' message.
 type JoinRoomPayload struct {
-	RoomID   string `json:"room_id"`
+	RoomName string `json:"room_name"`
 	Password string `json:"password"`
 }
 
 // LeaveRoomPayload is the payload for the 'leave_room' message.
 type LeaveRoomPayload struct {
-	RoomID string `json:"room_id"`
+	RoomName string `json:"room_name"`
 }
 
-// SendRoomMessagePayload is the payload for the 'send_room_message' message.
-type SendRoomMessagePayload struct {
-	RoomID  string `json:"room_id"`
-	Content string `json:"content"`
+// ListMembersPayload is the payload for the 'list_members' message.
+type ListMembersPayload struct {
+	RoomName string `json:"room_name"`
+}
+
+// RoomMembersPayload is the payload for the 'room_members' message.
+type RoomMembersPayload struct {
+	RoomName string   `json:"room_name"`
+	Members  []string `json:"members"` // List of nicknames
 }
 
 // RoomInfo represents basic information about a room.
 type RoomInfo struct {
-	ID   string `json:"id"`
+	ID   string `json:"id"` // This is the UUID
 	Name string `json:"name"`
 }
 
