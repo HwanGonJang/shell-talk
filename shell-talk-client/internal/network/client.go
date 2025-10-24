@@ -93,7 +93,7 @@ func (c *Client) writePump() {
 // HandleStdin is the main loop for reading user input post-authentication.
 func (c *Client) HandleStdin() {
 	reader := bufio.NewReader(os.Stdin)
-	c.updateView()
+	c.redrawView()
 
 	for {
 		input, _ := reader.ReadString('\n')
@@ -118,7 +118,7 @@ func (c *Client) handleCommand(input string) {
 
 	switch command {
 	case "/help":
-		c.updateView()
+		c.redrawView()
 		return
 	case "/create":
 		if len(parts) < 3 {
@@ -158,14 +158,14 @@ func (c *Client) handleCommand(input string) {
 		if err := c.switchConversation(convType, name); err != nil {
 			c.printToScreen(fmt.Sprintf("[ERROR] %s", err.Error()))
 		} else {
-			c.updateView()
+			c.redrawView()
 		}
 		return
 	case "/exit":
 		c.mu.Lock()
 		c.currentConversation = nil
 		c.mu.Unlock()
-		c.updateView()
+		c.redrawView()
 		return
 	default:
 		c.printToScreen(fmt.Sprintf("[ERROR] Unknown command: %s", command))
@@ -196,7 +196,7 @@ func (c *Client) handleChatMessage(input string) {
 
 	formattedMsg := fmt.Sprintf("[%s] [Me]: %s", time.Now().Format("15:04:05"), input)
 	conv.addHistory(formattedMsg)
-	c.updateView()
+	c.printToScreen(formattedMsg)
 }
 
 func (c *Client) handleServerMessage(msg WebSocketMessage) {
@@ -218,8 +218,9 @@ func (c *Client) handleServerMessage(msg WebSocketMessage) {
 		sender := payload["sender"].(string)
 		content := payload["content"].(string)
 		conv := c.getOrCreateConversation(sender, "DM")
-		conv.addHistory(fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content))
-		c.notifyOrUpdate("dm_" + sender)
+		formattedMsg := fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content)
+		conv.addHistory(formattedMsg)
+		c.notifyOrUpdate(sender, "DM", formattedMsg)
 
 	case "room_message":
 		var payload map[string]interface{}
@@ -228,8 +229,9 @@ func (c *Client) handleServerMessage(msg WebSocketMessage) {
 		sender := payload["sender_nickname"].(string)
 		content := payload["content"].(string)
 		conv := c.getOrCreateConversation(roomName, "ROOM")
-		conv.addHistory(fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content))
-		c.notifyOrUpdate("room_" + roomName)
+		formattedMsg := fmt.Sprintf("[%s] [%s]: %s", timestamp, sender, content)
+		conv.addHistory(formattedMsg)
+		c.notifyOrUpdate(roomName, "ROOM", formattedMsg)
 
 	case "join_success":
 		var payload JoinSuccessPayload
@@ -243,7 +245,6 @@ func (c *Client) handleServerMessage(msg WebSocketMessage) {
 	case "leave_success":
 		var payload LeaveSuccessPayload
 		_ = json.Unmarshal(payloadBytes, &payload)
-		// We need a way to map room ID back to room name if we want to update the conversation
 		c.printToScreen(fmt.Sprintf("[SYSTEM] Successfully left a room."))
 
 	case "room_list":
@@ -339,7 +340,7 @@ func (c *Client) getOrCreateConversation_internal(name, convType string) *Conver
 	return conv
 }
 
-func (c *Client) updateView() {
+func (c *Client) redrawView() {
 	clearScreen()
 	c.mu.RLock()
 	conv := c.currentConversation
@@ -367,7 +368,7 @@ func (c *Client) listMyRooms() {
 
 	found := false
 	for key, conv := range c.conversations {
-		if strings.HasPrefix(key, "room_") {
+		if strings.HasPrefix(key, "ROOM_") {
 			conv.mu.RLock()
 			joined := conv.Joined
 			conv.mu.RUnlock()
@@ -403,24 +404,21 @@ func (c *Client) prompt() {
 	fmt.Print(prompt)
 }
 
-func (c *Client) notifyOrUpdate(key string) {
+func (c *Client) notifyOrUpdate(name, convType, message string) {
+	key := convType + "_" + name
 	c.mu.RLock()
 	isCurrent := false
 	if c.currentConversation != nil {
 		currentKey := c.currentConversation.Type + "_" + c.currentConversation.ID
 		isCurrent = (currentKey == key)
 	}
-	conv, _ := c.conversations[key]
+	inLobby := c.currentConversation == nil
 	c.mu.RUnlock()
 
 	if isCurrent {
-		c.updateView()
-	} else {
-		if conv != nil {
-			c.printToScreen(fmt.Sprintf("New message in %s (%s)", conv.ID, conv.Type))
-		} else {
-			c.printToScreen("New message received.")
-		}
+		c.printToScreen(message)
+	} else if inLobby {
+		c.printToScreen(fmt.Sprintf("New message in %s (%s)", name, convType))
 	}
 }
 
