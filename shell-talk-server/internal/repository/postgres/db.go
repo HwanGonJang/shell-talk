@@ -42,7 +42,7 @@ func RunMigrations(dataSourceName string) error {
 	// When running from `cmd/server`, it should be `../../internal/repository/postgres/migrations`
 	// A more robust solution would use absolute paths or embed.
 	m, err := migrate.NewWithDatabaseInstance(
-		"file://../../internal/repository/postgres/migrations",
+		"file://internal/repository/postgres/migrations",
 		"postgres",
 		driver,
 	)
